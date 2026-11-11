@@ -11,7 +11,6 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// Funzione che cerca la stazione nell'elenco della Regione
 function trovaStazione(stazioni, cercato) {
     let s = stazioni.find(item =>
         (item.nomestaz && item.nomestaz.toLowerCase() === cercato) ||
@@ -23,13 +22,10 @@ function trovaStazione(stazioni, cercato) {
     return s;
 }
 
-// Funzione che torna indietro di 15 min alla volta se il valore è null
 async function recuperaUltimoValoreValido(nomeCercato) {
     const quartoDora = 1000 * 60 * 15;
-    // Allinea l'orario di partenza all'ultimo quarto d'ora
     const oraBase = Math.floor(Date.now() / quartoDora) * quartoDora;
 
-    // Prova fino a 8 volte indietro nel tempo (da adesso fino a 2 ore fa)
     for (let tentativo = 0; tentativo <= 8; tentativo++) {
         const tempoRichiesto = oraBase - (tentativo * quartoDora);
         const urlApi = `https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-sensor-values-no-time?variabile=254,0,0/1,-,-,-/B13215&time=${tempoRichiesto}`;
@@ -44,7 +40,6 @@ async function recuperaUltimoValoreValido(nomeCercato) {
             return { errore: 'NON_TROVATA' };
         }
 
-        // Se ha trovato un numero valido (non null), lo restituisce subito!
         if (stazione.value !== null && stazione.value !== undefined) {
             const minutiFa = tentativo * 15;
             return { stazione, minutiFa };
@@ -82,7 +77,6 @@ async function controllaFiumi() {
             console.log(`✅ Trovato! Stazione: ${datiStazione.nomestaz} (ID: ${datiStazione.idstazione})`);
             console.log(`🌊 Livello: ${livelloAttuale} m (dato di circa ${risultato.minutiFa} min fa) | Tua soglia: ${allarme.soglia} m`);
 
-            // CASO A: Il fiume ha SUPERATO la soglia e non abbiamo ancora mandato l'allarme
             if (livelloAttuale >= allarme.soglia && !allarme.allarme_inviato) {
                 console.log(`🚨 SUPERAMENTO SOGLIA! Invio notifica per ${datiStazione.nomestaz}...`);
 
@@ -105,7 +99,6 @@ async function controllaFiumi() {
 
                 await documento.ref.update({ allarme_inviato: true });
             }
-            // CASO B: Il fiume è sceso SOTTO la soglia -> Riattiva l'allarme
             else if (livelloAttuale < allarme.soglia && allarme.allarme_inviato) {
                 await documento.ref.update({ allarme_inviato: false });
                 console.log(`📉 Il fiume è sceso sotto soglia: allarme riattivato per il futuro.`);
@@ -114,8 +107,12 @@ async function controllaFiumi() {
             }
         }
 
+        console.log("🏁 Controllo terminato, spengo la Sentinella.");
+        process.exit(0); // <--- QUESTO SPEGNE SUBITO IL PALLINO GIALLO E METTE LA SPUNTA VERDE!
+
     } catch (errore) {
         console.error("Errore durante il controllo:", errore);
+        process.exit(1);
     }
 }
 
