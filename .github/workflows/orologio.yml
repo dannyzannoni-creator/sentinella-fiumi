@@ -1,0 +1,26 @@
+name: Sentinella Fiumi
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  controlla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica la Sentinella
+        uses: actions/checkout@v4
+
+      - name: Accendi Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Installa collegamenti Firebase
+        run: npm install
+
+      - name: Controlla il livello dei fiumi
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: node controllo.js
