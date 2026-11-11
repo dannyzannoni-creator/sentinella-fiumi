@@ -1,13 +1,16 @@
 name: Sentinella Fiumi
 
 on:
+  push:
+    branches: [ main ]
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
   controlla:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2
     steps:
       - name: Scarica la Sentinella
         uses: actions/checkout@v4
