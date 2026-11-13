@@ -7,9 +7,59 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
-async function controllaFiumi() {
-    console.log("🌊 Avvio controllo ARPAE...");
+// Scarica l'ultimissimo punto del grafico della singola stazione (tempo reale)
+async function leggiUltimoValoreGrafico(idStazione) {
+    const adesso = Date.now() + (1000 * 60 * 30);
+    const inizio = Date.now() - (1000 * 60 * 60 * 6); // Ultime 6 ore
+    const url = `https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-time-series?stazione=${encodeURIComponent(idStazione)}&variabile=254,0,0/1,-,-,-/B13215&timeStart=${inizio}&timeEnd=${adesso}&_=${Date.now()}`;
 
+    try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const dati = await res.json();
+        if (!Array.isArray(dati) || dati.length === 0) return null;
+
+        const validi = dati
+            .map(p => ({
+                t: Number(p.t ?? p.time ?? p.timestamp ?? p[0]),
+                v: (p.v !== undefined ? p.v : (p.value !== undefined ? p.value : p[1]))
+            }))
+            .filter(p => Number.isFinite(p.t) && p.v !== null && p.v !== undefined && !isNaN(Number(p.v)))
+            .map(p => ({ t: p.t, v: Number(p.v) }))
+            .sort((a, b) => a.t - b.t);
+
+        if (validi.length === 0) return null;
+        return Number(validi[validi.length - 1].v.toFixed(2));
+    } catch (e) {
+        return null;
+    }
+}
+
+async function inviaPushAndroid(tokens, titolo, messaggio) {
+    const listaToken = Array.isArray(tokens) ? tokens.filter(Boolean) : [tokens].filter(Boolean);
+    if (listaToken.length === 0) return;
+
+    const payload = {
+        notification: { title: titolo, body: messaggio },
+        android: {
+            priority: "high",
+            notification: {
+                channelId: "allerta_fiumi_high",
+                sound: "default",
+                priority: "high",
+                defaultSound: true,
+                defaultVibrateTimings: true
+            }
+        },
+        tokens: [...new Set(listaToken)]
+    };
+
+    const resp = await admin.messaging().sendEachForMulticast(payload);
+    console.log(`📨 Push inviata: ${resp.successCount} ricevute, ${resp.failureCount} fallite.`);
+}
+
+async function controllaFiumi() {
+    console.log("🌊 1. Scarico anagrafica e soglie stazioni ARPAE...");
     const quarto = 1000 * 60 * 15;
     const oraBase = Math.floor(Date.now() / quarto) * quarto;
     const stazioni = {};
@@ -25,53 +75,84 @@ async function controllaFiumi() {
             });
         }
     } catch (e) {
-        console.error("Errore download ARPAE:", e);
+        console.error("Errore download anagrafica ARPAE:", e);
         return;
     }
 
-    // 1. CONTROLLO SOGLIE PERSONALIZZATE DELL'UTENTE (MANTENUTO INALTERATO)
-    console.log("🔍 Controllo soglie personalizzate...");
-    const snapAllarmi = await db.collection("allarmi").where("allarme_inviato", "==", false).get();
-
-    for (const d of snapAllarmi.docs) {
-        const allarme = d.data();
-        const staz = Object.values(stazioni).find(s => (s.nomestaz || '').replace(/'/g, "\\'") === allarme.stazione);
-
-        if (staz && staz.value !== null && staz.value >= allarme.soglia && allarme.fcm_token) {
-            console.log(`🚨 ALLARME CUSTOM SUPERATO: ${allarme.stazione} (${staz.value}m >= ${allarme.soglia}m)`);
-
-            try {
-                await admin.messaging().send({
-                    notification: {
-                        title: "🌊 Sentinella: Soglia Personalizzata!",
-                        body: `Il fiume a ${allarme.stazione} ha raggiunto ${staz.value} m.`
-                    },
-                    token: allarme.fcm_token
-                });
-                await db.collection("allarmi").doc(d.id).update({ allarme_inviato: true });
-            } catch (e) { console.error("Errore invio push custom:", e); }
-        }
-    }
-
-    // 2. NUOVO CONTROLLO SOGLIE AUTOMATICHE (S1, S2, S3)
-    console.log("🔍 Controllo soglie ufficiali per le stazioni monitorate...");
+    // Raccoglie tutti i token e tutte le stazioni da monitorare
     const dispositiviSnap = await db.collection("dispositivi").get();
-    const mappaMonitoraggi = {}; // Mappa { idStazione: [token1, token2] }
+    const mappaMonitoraggi = {}; // { idStazione: [token1, token2] }
+    const tuttiTokenDispositivi = [];
 
     dispositiviSnap.forEach(d => {
         const token = d.id;
+        tuttiTokenDispositivi.push(token);
         (d.data().monitorate || []).forEach(idStaz => {
             if (!mappaMonitoraggi[idStaz]) mappaMonitoraggi[idStaz] = [];
             mappaMonitoraggi[idStaz].push(token);
         });
     });
 
-    // Legge lo stato precedente per non fare "spam"
+    const snapAllarmi = await db.collection("allarmi").get();
+
+    // Costruisce la lista unica delle stazioni che ci interessano davvero per interrogarne il grafico in tempo reale
+    const idDaAggiornareDalGrafico = new Set(Object.keys(mappaMonitoraggi));
+    snapAllarmi.docs.forEach(d => {
+        const al = d.data();
+        if (al.idstazione) idDaAggiornareDalGrafico.add(String(al.idstazione));
+        else {
+            const trovata = Object.values(stazioni).find(s => (s.nomestaz || '').trim().toLowerCase() === (al.stazione || '').trim().toLowerCase());
+            if (trovata) idDaAggiornareDalGrafico.add(String(trovata.idstazione));
+        }
+    });
+
+    console.log(`⚡ 2. Aggiorno dal grafico in tempo reale ${idDaAggiornareDalGrafico.size} stazioni...`);
+    const idsArray = Array.from(idDaAggiornareDalGrafico);
+    for (let i = 0; i < idsArray.length; i += 10) {
+        const lotto = idsArray.slice(i, i + 10);
+        await Promise.all(lotto.map(async (idStaz) => {
+            const valFresco = await leggiUltimoValoreGrafico(idStaz);
+            if (valFresco !== null && stazioni[idStaz]) {
+                stazioni[idStaz].value = valFresco;
+            }
+        }));
+    }
+
+    // 3. CONTROLLO SOGLIE PERSONALIZZATE (🔔)
+    console.log("🔍 3. Controllo soglie personalizzate...");
+    for (const d of snapAllarmi.docs) {
+        const allarme = d.data();
+        let staz = allarme.idstazione ? stazioni[allarme.idstazione] : null;
+        if (!staz) {
+            staz = Object.values(stazioni).find(s => (s.nomestaz || '').trim().toLowerCase() === (allarme.stazione || '').trim().toLowerCase());
+        }
+        if (!staz || staz.value === null) continue;
+
+        const val = Number(staz.value);
+        const soglia = Number(allarme.soglia);
+        const tokenDest = allarme.fcm_token ? [allarme.fcm_token] : tuttiTokenDispositivi;
+
+        if (!allarme.allarme_inviato && val >= soglia) {
+            console.log(`🚨 SOGLIA CUSTOM SUPERATA: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
+            await inviaPushAndroid(
+                tokenDest,
+                `🔔 Allarme: ${staz.nomestaz}`,
+                `Livello attuale: ${val} m (superata la tua soglia di ${soglia} m)`
+            );
+            await db.collection("allarmi").doc(d.id).update({ allarme_inviato: true });
+        } else if (allarme.allarme_inviato && val < soglia) {
+            // Auto-reset quando il fiume torna sotto la tua soglia
+            await db.collection("allarmi").doc(d.id).update({ allarme_inviato: false });
+        }
+    }
+
+    // 4. CONTROLLO SOGLIE UFFICIALI AUTOMATICHE (S1, S2, S3)
+    console.log("🔍 4. Controllo soglie ufficiali S1/S2/S3...");
     const statiSnap = await db.collection("stati_stazioni").get();
     const statiSalvati = {};
     statiSnap.forEach(d => statiSalvati[d.id] = d.data().livello_allerta || 0);
 
-    const batch = db.batch(); // Salva tutti i nuovi stati assieme alla fine
+    const batch = db.batch();
 
     for (const [idStaz, tokens] of Object.entries(mappaMonitoraggi)) {
         if (tokens.length === 0) continue;
@@ -79,43 +160,38 @@ async function controllaFiumi() {
         if (!staz || staz.value === null) continue;
 
         const val = Number(staz.value);
-        const s1 = Number(staz.soglia1) || 999;
-        const s2 = Number(staz.soglia2) || 999;
-        const s3 = Number(staz.soglia3) || 999;
+        const s1 = Number(staz.soglia1) || 0;
+        const s2 = Number(staz.soglia2) || 0;
+        const s3 = Number(staz.soglia3) || 0;
 
-        // Calcola in che fascia ci troviamo ora
-        let livelloAttuale = 0, nomeSoglia = "", coloreIcona = "";
-        if (staz.soglia3 > 0 && val >= s3) { livelloAttuale = 3; nomeSoglia = "Soglia 3 (Rossa)"; coloreIcona = "🔴"; }
-        else if (staz.soglia2 > 0 && val >= s2) { livelloAttuale = 2; nomeSoglia = "Soglia 2 (Arancione)"; coloreIcona = "🟠"; }
-        else if (staz.soglia1 > 0 && val >= s1) { livelloAttuale = 1; nomeSoglia = "Soglia 1 (Gialla)"; coloreIcona = "🟡"; }
+        let livelloAttuale = 0, nomeSoglia = "", icona = "";
+        if (s3 > 0 && val >= s3) { livelloAttuale = 3; nomeSoglia = `Soglia 3 ROSSA (${s3}m)`; icona = "🔴"; }
+        else if (s2 > 0 && val >= s2) { livelloAttuale = 2; nomeSoglia = `Soglia 2 ARANCIONE (${s2}m)`; icona = "🟠"; }
+        else if (s1 > 0 && val >= s1) { livelloAttuale = 1; nomeSoglia = `Soglia 1 GIALLA (${s1}m)`; icona = "🟡"; }
 
         const livelloPrecedente = statiSalvati[idStaz] || 0;
 
-        // Se l'acqua è salita di livello (es. da Verde a Giallo, o da Giallo ad Arancione)
         if (livelloAttuale > livelloPrecedente) {
-            console.log(`⚠️ SUPERAMENTO: ${staz.nomestaz} -> ${nomeSoglia} (${val}m)`);
-
-            try {
-                await admin.messaging().sendEachForMulticast({
-                    notification: {
-                        title: `${coloreIcona} Allerta Ufficiale: ${staz.nomestaz}`,
-                        body: `Il livello ha raggiunto ${val} m, superando la ${nomeSoglia}!`
-                    },
-                    tokens: tokens
-                });
-                console.log(`✅ Push ufficiale inviata.`);
-            } catch (e) { console.error("Errore invio push ufficiale:", e); }
+            console.log(`⚠️ SOGLIA UFFICIALE SUPERATA: ${staz.nomestaz} -> ${nomeSoglia} (Attuale: ${val}m)`);
+            await inviaPushAndroid(
+                tokens,
+                `${icona} ${staz.nomestaz}: ${nomeSoglia}`,
+                `Il fiume ${staz.corso_acqua || ''} a ${staz.nomestaz} ha raggiunto ${val} m.`
+            );
         }
 
-        // Memorizza il nuovo stato (sia che salga, sia che scenda) per le prossime letture
         if (livelloAttuale !== livelloPrecedente) {
-            const docRef = db.collection("stati_stazioni").doc(idStaz);
-            batch.set(docRef, { livello_allerta: livelloAttuale }, { merge: true });
+            batch.set(db.collection("stati_stazioni").doc(idStaz), {
+                stazione: staz.nomestaz,
+                livello_allerta: livelloAttuale,
+                ultimo_valore: val,
+                aggiornato_il: new Date().toISOString()
+            }, { merge: true });
         }
     }
 
     await batch.commit();
-    console.log("🏁 Controllo completato.");
+    console.log("🏁 Controllo completato con successo.");
 }
 
 controllaFiumi();
