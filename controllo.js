@@ -7,10 +7,13 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
-// Scarica l'ultimissimo punto del grafico della singola stazione (tempo reale)
+// Funzione per i decimali (es. 7 -> "7,00")
+const fmt = (n) => Number(n).toFixed(2).replace('.', ',');
+
+// Scarica l'ultimissimo punto dal grafico
 async function leggiUltimoValoreGrafico(idStazione) {
     const adesso = Date.now() + (1000 * 60 * 30);
-    const inizio = Date.now() - (1000 * 60 * 60 * 6); // Ultime 6 ore
+    const inizio = Date.now() - (1000 * 60 * 60 * 6);
     const url = `https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-time-series?stazione=${encodeURIComponent(idStazione)}&variabile=254,0,0/1,-,-,-/B13215&timeStart=${inizio}&timeEnd=${adesso}&_=${Date.now()}`;
 
     try {
@@ -35,6 +38,7 @@ async function leggiUltimoValoreGrafico(idStazione) {
     }
 }
 
+// Invia notifica ad alta priorità per svegliare Android
 async function inviaPushAndroid(tokens, titolo, messaggio) {
     const listaToken = Array.isArray(tokens) ? tokens.filter(Boolean) : [tokens].filter(Boolean);
     if (listaToken.length === 0) return;
@@ -59,7 +63,7 @@ async function inviaPushAndroid(tokens, titolo, messaggio) {
 }
 
 async function controllaFiumi() {
-    console.log("🌊 1. Scarico anagrafica e soglie stazioni ARPAE...");
+    console.log("🌊 1. Scarico anagrafica ARPAE...");
     const quarto = 1000 * 60 * 15;
     const oraBase = Math.floor(Date.now() / quarto) * quarto;
     const stazioni = {};
@@ -79,9 +83,8 @@ async function controllaFiumi() {
         return;
     }
 
-    // Raccoglie tutti i token e tutte le stazioni da monitorare
     const dispositiviSnap = await db.collection("dispositivi").get();
-    const mappaMonitoraggi = {}; // { idStazione: [token1, token2] }
+    const mappaMonitoraggi = {};
     const tuttiTokenDispositivi = [];
 
     dispositiviSnap.forEach(d => {
@@ -94,9 +97,8 @@ async function controllaFiumi() {
     });
 
     const snapAllarmi = await db.collection("allarmi").get();
-
-    // Costruisce la lista unica delle stazioni che ci interessano davvero per interrogarne il grafico in tempo reale
     const idDaAggiornareDalGrafico = new Set(Object.keys(mappaMonitoraggi));
+
     snapAllarmi.docs.forEach(d => {
         const al = d.data();
         if (al.idstazione) idDaAggiornareDalGrafico.add(String(al.idstazione));
@@ -118,7 +120,6 @@ async function controllaFiumi() {
         }));
     }
 
-    // 3. CONTROLLO SOGLIE PERSONALIZZATE (🔔)
     console.log("🔍 3. Controllo soglie personalizzate...");
     for (const d of snapAllarmi.docs) {
         const allarme = d.data();
@@ -137,16 +138,14 @@ async function controllaFiumi() {
             await inviaPushAndroid(
                 tokenDest,
                 `🔔 Allarme: ${staz.nomestaz}`,
-                `Livello attuale: ${val} m (superata la tua soglia di ${soglia} m)`
+                `Livello attuale: ${fmt(val)} m (superata la soglia di ${fmt(soglia)} m)`
             );
             await db.collection("allarmi").doc(d.id).update({ allarme_inviato: true });
         } else if (allarme.allarme_inviato && val < soglia) {
-            // Auto-reset quando il fiume torna sotto la tua soglia
             await db.collection("allarmi").doc(d.id).update({ allarme_inviato: false });
         }
     }
 
-    // 4. CONTROLLO SOGLIE UFFICIALI AUTOMATICHE (S1, S2, S3)
     console.log("🔍 4. Controllo soglie ufficiali S1/S2/S3...");
     const statiSnap = await db.collection("stati_stazioni").get();
     const statiSalvati = {};
@@ -165,9 +164,9 @@ async function controllaFiumi() {
         const s3 = Number(staz.soglia3) || 0;
 
         let livelloAttuale = 0, nomeSoglia = "", icona = "";
-        if (s3 > 0 && val >= s3) { livelloAttuale = 3; nomeSoglia = `Soglia 3 ROSSA (${s3}m)`; icona = "🔴"; }
-        else if (s2 > 0 && val >= s2) { livelloAttuale = 2; nomeSoglia = `Soglia 2 ARANCIONE (${s2}m)`; icona = "🟠"; }
-        else if (s1 > 0 && val >= s1) { livelloAttuale = 1; nomeSoglia = `Soglia 1 GIALLA (${s1}m)`; icona = "🟡"; }
+        if (s3 > 0 && val >= s3) { livelloAttuale = 3; nomeSoglia = `Soglia 3 ROSSA (${fmt(s3)} m)`; icona = "🔴"; }
+        else if (s2 > 0 && val >= s2) { livelloAttuale = 2; nomeSoglia = `Soglia 2 ARANCIONE (${fmt(s2)} m)`; icona = "🟠"; }
+        else if (s1 > 0 && val >= s1) { livelloAttuale = 1; nomeSoglia = `Soglia 1 GIALLA (${fmt(s1)} m)`; icona = "🟡"; }
 
         const livelloPrecedente = statiSalvati[idStaz] || 0;
 
@@ -175,8 +174,8 @@ async function controllaFiumi() {
             console.log(`⚠️ SOGLIA UFFICIALE SUPERATA: ${staz.nomestaz} -> ${nomeSoglia} (Attuale: ${val}m)`);
             await inviaPushAndroid(
                 tokens,
-                `${icona} ${staz.nomestaz}: ${nomeSoglia}`,
-                `Il fiume ${staz.corso_acqua || ''} a ${staz.nomestaz} ha raggiunto ${val} m.`
+                `${icona} ${staz.nomestaz}: ${nomeSoglia.split(' (')[0]}`,
+                `Il fiume a ${staz.nomestaz} ha raggiunto ${fmt(val)} m.`
             );
         }
 
@@ -191,7 +190,7 @@ async function controllaFiumi() {
     }
 
     await batch.commit();
-    console.log("🏁 Controllo completato con successo.");
+    console.log("🏁 Controllo completato.");
 }
 
 controllaFiumi();
