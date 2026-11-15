@@ -48,10 +48,10 @@ async function inviaPushAndroid(tokens, titolo, messaggio) {
         android: {
             priority: "high",
             notification: {
-                channelId: "allerta_fiumi_high",
-                sound: "default",
+                channelId: "allarme_sirena_v1", // Deve essere identico all'ID in index.html
+                sound: "sirena.mp3",            // Nome del file audio
                 priority: "high",
-                defaultSound: true,
+                defaultSound: false,
                 defaultVibrateTimings: true
             }
         },
