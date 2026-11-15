@@ -10,14 +10,17 @@ const db = admin.firestore();
 // Funzione per i decimali (es. 7 -> "7,00")
 const fmt = (n) => Number(n).toFixed(2).replace('.', ',');
 
-// Scarica l'ultimissimo punto dal grafico
+// Piccola pausa per non saturare il server ARPAE (Anti-Ban)
+const pausa = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Scarica l'ultimissimo punto dal flusso del grafico ARPAE
 async function leggiUltimoValoreGrafico(idStazione) {
     const adesso = Date.now() + (1000 * 60 * 30);
     const inizio = Date.now() - (1000 * 60 * 60 * 6);
     const url = `https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-time-series?stazione=${encodeURIComponent(idStazione)}&variabile=254,0,0/1,-,-,-/B13215&timeStart=${inizio}&timeEnd=${adesso}&_=${Date.now()}`;
 
     try {
-        const res = await fetch(url);
+        const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
         if (!res.ok) return null;
         const dati = await res.json();
         if (!Array.isArray(dati) || dati.length === 0) return null;
@@ -38,7 +41,7 @@ async function leggiUltimoValoreGrafico(idStazione) {
     }
 }
 
-// Invia notifica ad alta priorità per svegliare Android
+// Invia notifica ad alta priorità con sirena per svegliare Android
 async function inviaPushAndroid(tokens, titolo, messaggio) {
     const listaToken = Array.isArray(tokens) ? tokens.filter(Boolean) : [tokens].filter(Boolean);
     if (listaToken.length === 0) return;
@@ -48,7 +51,7 @@ async function inviaPushAndroid(tokens, titolo, messaggio) {
         android: {
             priority: "high",
             notification: {
-                channelId: "allarme_sirena_v1", // Deve essere identico all'ID in index.html
+                channelId: "allarme_sirena_v1", // Identico all'ID in index.html
                 sound: "sirena.mp3",            // Nome del file audio
                 priority: "high",
                 defaultSound: false,
@@ -63,7 +66,7 @@ async function inviaPushAndroid(tokens, titolo, messaggio) {
 }
 
 async function controllaFiumi() {
-    console.log("🌊 1. Scarico anagrafica ARPAE...");
+    console.log("🌊 1. Scarico anagrafica e tabellone globale ARPAE...");
     const quarto = 1000 * 60 * 15;
     const oraBase = Math.floor(Date.now() / quarto) * quarto;
     const stazioni = {};
@@ -79,11 +82,17 @@ async function controllaFiumi() {
             });
         }
     } catch (e) {
-        console.error("Errore download anagrafica ARPAE:", e);
+        console.error("❌ Errore download anagrafica ARPAE:", e);
         return;
     }
 
-    const dispositiviSnap = await db.collection("dispositivi").get();
+    // Lettura dispositivi, allarmi personalizzati e stati precedenti da Firebase
+    const [dispositiviSnap, snapAllarmi, statiSnap] = await Promise.all([
+        db.collection("dispositivi").get(),
+        db.collection("allarmi").get(),
+        db.collection("stati_stazioni").get()
+    ]);
+
     const mappaMonitoraggi = {};
     const tuttiTokenDispositivi = [];
 
@@ -96,31 +105,54 @@ async function controllaFiumi() {
         });
     });
 
-    const snapAllarmi = await db.collection("allarmi").get();
-    const idDaAggiornareDalGrafico = new Set(Object.keys(mappaMonitoraggi));
+    const statiSalvati = {};
+    statiSnap.forEach(d => statiSalvati[d.id] = d.data().livello_allerta || 0);
+
+    // SELEZIONE INTELLIGENTE ANTI-BAN:
+    // Interroghiamo il grafico singolo SOLO per:
+    // 1) Stazioni con Campanella personalizzata attiva
+    // 2) Stazioni monitorate vicine alla Soglia 1 (entro 40 cm) o già in allerta
+    const idDaAggiornareDalGrafico = new Set();
 
     snapAllarmi.docs.forEach(d => {
         const al = d.data();
-        if (al.idstazione) idDaAggiornareDalGrafico.add(String(al.idstazione));
-        else {
+        if (al.idstazione) {
+            idDaAggiornareDalGrafico.add(String(al.idstazione));
+        } else {
             const trovata = Object.values(stazioni).find(s => (s.nomestaz || '').trim().toLowerCase() === (al.stazione || '').trim().toLowerCase());
             if (trovata) idDaAggiornareDalGrafico.add(String(trovata.idstazione));
         }
     });
 
-    console.log(`⚡ 2. Aggiorno dal grafico in tempo reale ${idDaAggiornareDalGrafico.size} stazioni...`);
+    for (const idStaz of Object.keys(mappaMonitoraggi)) {
+        const s = stazioni[idStaz];
+        if (!s) continue;
+        const val = s.value !== null && s.value !== undefined ? Number(s.value) : null;
+        const s1 = Number(s.soglia1) || 0;
+        const giaInAllerta = (statiSalvati[idStaz] || 0) > 0;
+
+        // Se il dato globale è null, o era già in allerta, o è a meno di 40cm dalla Soglia 1 -> controllo col grafico!
+        if (val === null || giaInAllerta || (s1 > 0 && val >= (s1 - 0.40))) {
+            idDaAggiornareDalGrafico.add(String(idStaz));
+        }
+    }
+
+    console.log(`⚡ 2. Aggiorno dal grafico in tempo reale ${idDaAggiornareDalGrafico.size} stazioni prioritarie (su ${Object.keys(mappaMonitoraggi).length} monitorate)...`);
     const idsArray = Array.from(idDaAggiornareDalGrafico);
-    for (let i = 0; i < idsArray.length; i += 10) {
-        const lotto = idsArray.slice(i, i + 10);
+
+    // Esecuzione a piccoli lotti di 5 con pausa di 300ms (Anti-Ban)
+    for (let i = 0; i < idsArray.length; i += 5) {
+        const lotto = idsArray.slice(i, i + 5);
         await Promise.all(lotto.map(async (idStaz) => {
             const valFresco = await leggiUltimoValoreGrafico(idStaz);
             if (valFresco !== null && stazioni[idStaz]) {
                 stazioni[idStaz].value = valFresco;
             }
         }));
+        if (i + 5 < idsArray.length) await pausa(300);
     }
 
-    console.log("🔍 3. Controllo soglie personalizzate...");
+    console.log("🔔 3. Controllo soglie personalizzate (Campanelle)...");
     for (const d of snapAllarmi.docs) {
         const allarme = d.data();
         let staz = allarme.idstazione ? stazioni[allarme.idstazione] : null;
@@ -137,8 +169,8 @@ async function controllaFiumi() {
             console.log(`🚨 SOGLIA CUSTOM SUPERATA: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
             await inviaPushAndroid(
                 tokenDest,
-                `🔔 Allarme: ${staz.nomestaz}`,
-                `Livello attuale: ${fmt(val)} m (superata la soglia di ${fmt(soglia)} m)`
+                `🚨 Allarme: ${staz.nomestaz}`,
+                `Livello attuale: ${fmt(val)} m (superata la soglia impostata di ${fmt(soglia)} m)`
             );
             await db.collection("allarmi").doc(d.id).update({ allarme_inviato: true });
         } else if (allarme.allarme_inviato && val < soglia) {
@@ -146,11 +178,7 @@ async function controllaFiumi() {
         }
     }
 
-    console.log("🔍 4. Controllo soglie ufficiali S1/S2/S3...");
-    const statiSnap = await db.collection("stati_stazioni").get();
-    const statiSalvati = {};
-    statiSnap.forEach(d => statiSalvati[d.id] = d.data().livello_allerta || 0);
-
+    console.log("🚦 4. Controllo soglie ufficiali S1/S2/S3...");
     const batch = db.batch();
 
     for (const [idStaz, tokens] of Object.entries(mappaMonitoraggi)) {
@@ -190,7 +218,7 @@ async function controllaFiumi() {
     }
 
     await batch.commit();
-    console.log("🏁 Controllo completato.");
+    console.log("✅ Controllo completato con successo.");
 }
 
 controllaFiumi();
