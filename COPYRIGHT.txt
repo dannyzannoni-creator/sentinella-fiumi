@@ -1,1 +1,2 @@
 "Copyright (c) 2026 Danny Zannoni. Tutti i diritti riservati. È severamente vietata la copia, la modifica, la distribuzione o l'uso commerciale e non commerciale di questo codice senza esplicita autorizzazione scritta."
+"Copyright (c) 2026 Danny Zannoni. All rights reserved. Copying, modifying, distributing, or using this code whether for commercial or non commercial purposes is strictly prohibited without explicit written authorization."
