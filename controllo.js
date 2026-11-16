@@ -94,12 +94,15 @@ async function controllaFiumi() {
     ]);
 
     const mappaMonitoraggi = {};
-    const tuttiTokenDispositivi = [];
+    const mappaDeviceIdToToken = {};
 
     dispositiviSnap.forEach(d => {
         const token = d.id;
-        tuttiTokenDispositivi.push(token);
-        (d.data().monitorate || []).forEach(idStaz => {
+        const datiDisp = d.data();
+        if (datiDisp.device_id) {
+            mappaDeviceIdToToken[datiDisp.device_id] = token;
+        }
+        (datiDisp.monitorate || []).forEach(idStaz => {
             if (!mappaMonitoraggi[idStaz]) mappaMonitoraggi[idStaz] = [];
             mappaMonitoraggi[idStaz].push(token);
         });
@@ -108,10 +111,7 @@ async function controllaFiumi() {
     const statiSalvati = {};
     statiSnap.forEach(d => statiSalvati[d.id] = d.data().livello_allerta || 0);
 
-    // SELEZIONE INTELLIGENTE ANTI-BAN:
-    // Interroghiamo il grafico singolo SOLO per:
-    // 1) Stazioni con Campanella personalizzata attiva
-    // 2) Stazioni monitorate vicine alla Soglia 1 (entro 40 cm) o già in allerta
+    // SELEZIONE INTELLIGENTE ANTI-BAN
     const idDaAggiornareDalGrafico = new Set();
 
     snapAllarmi.docs.forEach(d => {
@@ -131,7 +131,6 @@ async function controllaFiumi() {
         const s1 = Number(s.soglia1) || 0;
         const giaInAllerta = (statiSalvati[idStaz] || 0) > 0;
 
-        // Se il dato globale è null, o era già in allerta, o è a meno di 40cm dalla Soglia 1 -> controllo col grafico!
         if (val === null || giaInAllerta || (s1 > 0 && val >= (s1 - 0.40))) {
             idDaAggiornareDalGrafico.add(String(idStaz));
         }
@@ -140,7 +139,6 @@ async function controllaFiumi() {
     console.log(`⚡ 2. Aggiorno dal grafico in tempo reale ${idDaAggiornareDalGrafico.size} stazioni prioritarie (su ${Object.keys(mappaMonitoraggi).length} monitorate)...`);
     const idsArray = Array.from(idDaAggiornareDalGrafico);
 
-    // Esecuzione a piccoli lotti di 5 con pausa di 300ms (Anti-Ban)
     for (let i = 0; i < idsArray.length; i += 5) {
         const lotto = idsArray.slice(i, i + 5);
         await Promise.all(lotto.map(async (idStaz) => {
@@ -152,7 +150,7 @@ async function controllaFiumi() {
         if (i + 5 < idsArray.length) await pausa(300);
     }
 
-    console.log("🔔 3. Controllo soglie personalizzate (Campanelle)...");
+    console.log("🔔 3. Controllo soglie personalizzate (Campanelle singole per utente)...");
     for (const d of snapAllarmi.docs) {
         const allarme = d.data();
         let staz = allarme.idstazione ? stazioni[allarme.idstazione] : null;
@@ -163,14 +161,17 @@ async function controllaFiumi() {
 
         const val = Number(staz.value);
         const soglia = Number(allarme.soglia);
-        const tokenDest = allarme.fcm_token ? [allarme.fcm_token] : tuttiTokenDispositivi;
+
+        // Invia SOLO al proprietario dell'allarme (tramite fcm_token o device_id associato)
+        const tokenProprietario = allarme.fcm_token || (allarme.device_id ? mappaDeviceIdToToken[allarme.device_id] : null);
+        if (!tokenProprietario) continue;
 
         if (!allarme.allarme_inviato && val >= soglia) {
-            console.log(`🚨 SOGLIA CUSTOM SUPERATA: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
+            console.log(`🚨 SOGLIA CUSTOM SUPERATA per singolo utente: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
             await inviaPushAndroid(
-                tokenDest,
-                `🚨 Allarme: ${staz.nomestaz}`,
-                `Livello attuale: ${fmt(val)} m (superata la soglia impostata di ${fmt(soglia)} m)`
+                [tokenProprietario],
+                `🚨 Allarme Personalizzato: ${staz.nomestaz}`,
+                `Livello attuale: ${fmt(val)} m (superata la tua soglia di ${fmt(soglia)} m)`
             );
             await db.collection("allarmi").doc(d.id).update({ allarme_inviato: true });
         } else if (allarme.allarme_inviato && val < soglia) {
@@ -178,7 +179,7 @@ async function controllaFiumi() {
         }
     }
 
-    console.log("🚦 4. Controllo soglie ufficiali S1/S2/S3...");
+    console.log("🚦 4. Controllo soglie ufficiali S1/S2/S3 (Per tutti gli utenti che monitorano la stazione)...");
     const batch = db.batch();
 
     for (const [idStaz, tokens] of Object.entries(mappaMonitoraggi)) {
