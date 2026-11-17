@@ -10,7 +10,7 @@ const db = admin.firestore();
 // Funzione per i decimali (es. 7 -> "7,00")
 const fmt = (n) => Number(n).toFixed(2).replace('.', ',');
 
-// Piccola pausa per non saturare il server ARPAE (Anti-Ban)
+// Piccola pausa per distribuire le richieste senza farsi bloccare da ARPAE
 const pausa = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Scarica l'ultimissimo punto dal flusso del grafico ARPAE
@@ -51,8 +51,8 @@ async function inviaPushAndroid(tokens, titolo, messaggio) {
         android: {
             priority: "high",
             notification: {
-                channelId: "allarme_sirena_v1", // Identico all'ID in index.html
-                sound: "sirena.mp3",            // Nome del file audio
+                channelId: "allarme_sirena_v1",
+                sound: "sirena.mp3",
                 priority: "high",
                 defaultSound: false,
                 defaultVibrateTimings: true
@@ -66,7 +66,7 @@ async function inviaPushAndroid(tokens, titolo, messaggio) {
 }
 
 async function controllaFiumi() {
-    console.log("🌊 1. Scarico anagrafica e tabellone globale ARPAE...");
+    console.log("🌊 1. Scarico anagrafica ARPAE...");
     const quarto = 1000 * 60 * 15;
     const oraBase = Math.floor(Date.now() / quarto) * quarto;
     const stazioni = {};
@@ -86,7 +86,6 @@ async function controllaFiumi() {
         return;
     }
 
-    // Lettura dispositivi, allarmi personalizzati e stati precedenti da Firebase
     const [dispositiviSnap, snapAllarmi, statiSnap] = await Promise.all([
         db.collection("dispositivi").get(),
         db.collection("allarmi").get(),
@@ -111,8 +110,8 @@ async function controllaFiumi() {
     const statiSalvati = {};
     statiSnap.forEach(d => statiSalvati[d.id] = d.data().livello_allerta || 0);
 
-    // SELEZIONE INTELLIGENTE ANTI-BAN
-    const idDaAggiornareDalGrafico = new Set();
+    // TUTTE le stazioni monitorate e tutte quelle con campanella vengono lette dal grafico in tempo reale!
+    const idDaAggiornareDalGrafico = new Set(Object.keys(mappaMonitoraggi));
 
     snapAllarmi.docs.forEach(d => {
         const al = d.data();
@@ -124,21 +123,10 @@ async function controllaFiumi() {
         }
     });
 
-    for (const idStaz of Object.keys(mappaMonitoraggi)) {
-        const s = stazioni[idStaz];
-        if (!s) continue;
-        const val = s.value !== null && s.value !== undefined ? Number(s.value) : null;
-        const s1 = Number(s.soglia1) || 0;
-        const giaInAllerta = (statiSalvati[idStaz] || 0) > 0;
-
-        if (val === null || giaInAllerta || (s1 > 0 && val >= (s1 - 0.40))) {
-            idDaAggiornareDalGrafico.add(String(idStaz));
-        }
-    }
-
-    console.log(`⚡ 2. Aggiorno dal grafico in tempo reale ${idDaAggiornareDalGrafico.size} stazioni prioritarie (su ${Object.keys(mappaMonitoraggi).length} monitorate)...`);
+    console.log(`⚡ 2. Aggiorno dal grafico in tempo reale tutte le ${idDaAggiornareDalGrafico.size} stazioni monitorate...`);
     const idsArray = Array.from(idDaAggiornareDalGrafico);
 
+    // Lotti da 5 con micro-pausa di 250ms: veloce ma invisibile al firewall
     for (let i = 0; i < idsArray.length; i += 5) {
         const lotto = idsArray.slice(i, i + 5);
         await Promise.all(lotto.map(async (idStaz) => {
@@ -147,7 +135,7 @@ async function controllaFiumi() {
                 stazioni[idStaz].value = valFresco;
             }
         }));
-        if (i + 5 < idsArray.length) await pausa(300);
+        if (i + 5 < idsArray.length) await pausa(250);
     }
 
     console.log("🔔 3. Controllo soglie personalizzate (Campanelle singole per utente)...");
@@ -161,13 +149,11 @@ async function controllaFiumi() {
 
         const val = Number(staz.value);
         const soglia = Number(allarme.soglia);
-
-        // Invia SOLO al proprietario dell'allarme (tramite fcm_token o device_id associato)
         const tokenProprietario = allarme.fcm_token || (allarme.device_id ? mappaDeviceIdToToken[allarme.device_id] : null);
         if (!tokenProprietario) continue;
 
         if (!allarme.allarme_inviato && val >= soglia) {
-            console.log(`🚨 SOGLIA CUSTOM SUPERATA per singolo utente: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
+            console.log(`🚨 SOGLIA CUSTOM SUPERATA: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
             await inviaPushAndroid(
                 [tokenProprietario],
                 `🚨 Allarme Personalizzato: ${staz.nomestaz}`,
@@ -179,7 +165,7 @@ async function controllaFiumi() {
         }
     }
 
-    console.log("🚦 4. Controllo soglie ufficiali S1/S2/S3 (Per tutti gli utenti che monitorano la stazione)...");
+    console.log("🚦 4. Controllo soglie ufficiali S1/S2/S3...");
     const batch = db.batch();
 
     for (const [idStaz, tokens] of Object.entries(mappaMonitoraggi)) {
@@ -192,20 +178,30 @@ async function controllaFiumi() {
         const s2 = Number(staz.soglia2) || 0;
         const s3 = Number(staz.soglia3) || 0;
 
-        let livelloAttuale = 0, nomeSoglia = "", icona = "";
-        if (s3 > 0 && val >= s3) { livelloAttuale = 3; nomeSoglia = `Soglia 3 ROSSA (${fmt(s3)} m)`; icona = "🔴"; }
-        else if (s2 > 0 && val >= s2) { livelloAttuale = 2; nomeSoglia = `Soglia 2 ARANCIONE (${fmt(s2)} m)`; icona = "🟠"; }
-        else if (s1 > 0 && val >= s1) { livelloAttuale = 1; nomeSoglia = `Soglia 1 GIALLA (${fmt(s1)} m)`; icona = "🟡"; }
+        let livelloAttuale = 0;
+        if (s3 > 0 && val >= s3) livelloAttuale = 3;
+        else if (s2 > 0 && val >= s2) livelloAttuale = 2;
+        else if (s1 > 0 && val >= s1) livelloAttuale = 1;
 
         const livelloPrecedente = statiSalvati[idStaz] || 0;
 
+        // Se il livello è salito, invia le notifiche per TUTTE le soglie superate (anche se ne salta due insieme)
         if (livelloAttuale > livelloPrecedente) {
-            console.log(`⚠️ SOGLIA UFFICIALE SUPERATA: ${staz.nomestaz} -> ${nomeSoglia} (Attuale: ${val}m)`);
-            await inviaPushAndroid(
-                tokens,
-                `${icona} ${staz.nomestaz}: ${nomeSoglia.split(' (')[0]}`,
-                `Il fiume a ${staz.nomestaz} ha raggiunto ${fmt(val)} m.`
-            );
+            for (let liv = livelloPrecedente + 1; liv <= livelloAttuale; liv++) {
+                let nomeSoglia = "", icona = "";
+                if (liv === 1 && s1 > 0) { nomeSoglia = `Soglia 1 GIALLA`; icona = "🟡"; }
+                else if (liv === 2 && s2 > 0) { nomeSoglia = `Soglia 2 ARANCIONE`; icona = "🟠"; }
+                else if (liv === 3 && s3 > 0) { nomeSoglia = `Soglia 3 ROSSA`; icona = "🔴"; }
+
+                if (nomeSoglia) {
+                    console.log(`⚠️ SOGLIA UFFICIALE SUPERATA: ${staz.nomestaz} -> ${nomeSoglia} (Attuale: ${val}m)`);
+                    await inviaPushAndroid(
+                        tokens,
+                        `${icona} ${staz.nomestaz}: ${nomeSoglia}`,
+                        `Il fiume a ${staz.nomestaz} ha raggiunto ${fmt(val)} m.`
+                    );
+                }
+            }
         }
 
         if (livelloAttuale !== livelloPrecedente) {
