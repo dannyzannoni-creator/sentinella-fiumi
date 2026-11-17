@@ -10,10 +10,16 @@ const db = admin.firestore();
 // Funzione per i decimali (es. 7 -> "7,00")
 const fmt = (n) => Number(n).toFixed(2).replace('.', ',');
 
+// Funzione per formattare l'orario nel fuso italiano (GitHub lavora in UTC)
+const formatOra = (ms) => {
+    if (!ms) return '';
+    return new Date(ms).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Rome' });
+};
+
 // Piccola pausa per distribuire le richieste senza farsi bloccare da ARPAE
 const pausa = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Scarica l'ultimissimo punto dal flusso del grafico ARPAE
+// Scarica l'ultimissimo punto dal flusso del grafico ARPAE (restituisce valore e orario)
 async function leggiUltimoValoreGrafico(idStazione) {
     const adesso = Date.now() + (1000 * 60 * 30);
     const inizio = Date.now() - (1000 * 60 * 60 * 6);
@@ -35,7 +41,9 @@ async function leggiUltimoValoreGrafico(idStazione) {
             .sort((a, b) => a.t - b.t);
 
         if (validi.length === 0) return null;
-        return Number(validi[validi.length - 1].v.toFixed(2));
+
+        const ultimo = validi[validi.length - 1];
+        return { v: Number(ultimo.v.toFixed(2)), t: ultimo.t };
     } catch (e) {
         return null;
     }
@@ -73,11 +81,13 @@ async function controllaFiumi() {
 
     try {
         for (let i = 0; i <= 2; i++) {
-            const res = await fetch(`https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-sensor-values-no-time?variabile=254,0,0/1,-,-,-/B13215&time=${oraBase - (i * quarto)}`);
+            const timestampQuarto = oraBase - (i * quarto);
+            const res = await fetch(`https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-sensor-values-no-time?variabile=254,0,0/1,-,-,-/B13215&time=${timestampQuarto}`);
             const data = await res.json();
             data.slice(1).forEach(s => {
                 if (s.idstazione && (!stazioni[s.idstazione] || stazioni[s.idstazione].value === null)) {
                     stazioni[s.idstazione] = s;
+                    stazioni[s.idstazione].timestamp_ms = timestampQuarto; // Salviamo l'orario base per sicurezza
                 }
             });
         }
@@ -110,7 +120,6 @@ async function controllaFiumi() {
     const statiSalvati = {};
     statiSnap.forEach(d => statiSalvati[d.id] = d.data().livello_allerta || 0);
 
-    // TUTTE le stazioni monitorate e tutte quelle con campanella vengono lette dal grafico in tempo reale!
     const idDaAggiornareDalGrafico = new Set(Object.keys(mappaMonitoraggi));
 
     snapAllarmi.docs.forEach(d => {
@@ -126,13 +135,13 @@ async function controllaFiumi() {
     console.log(`⚡ 2. Aggiorno dal grafico in tempo reale tutte le ${idDaAggiornareDalGrafico.size} stazioni monitorate...`);
     const idsArray = Array.from(idDaAggiornareDalGrafico);
 
-    // Lotti da 5 con micro-pausa di 250ms: veloce ma invisibile al firewall
     for (let i = 0; i < idsArray.length; i += 5) {
         const lotto = idsArray.slice(i, i + 5);
         await Promise.all(lotto.map(async (idStaz) => {
-            const valFresco = await leggiUltimoValoreGrafico(idStaz);
-            if (valFresco !== null && stazioni[idStaz]) {
-                stazioni[idStaz].value = valFresco;
+            const fresco = await leggiUltimoValoreGrafico(idStaz);
+            if (fresco !== null && stazioni[idStaz]) {
+                stazioni[idStaz].value = fresco.v;
+                stazioni[idStaz].timestamp_ms = fresco.t; // Sostituisce l'orario base con quello esatto al millisecondo del grafico
             }
         }));
         if (i + 5 < idsArray.length) await pausa(250);
@@ -152,12 +161,14 @@ async function controllaFiumi() {
         const tokenProprietario = allarme.fcm_token || (allarme.device_id ? mappaDeviceIdToToken[allarme.device_id] : null);
         if (!tokenProprietario) continue;
 
+        const stringaOrario = staz.timestamp_ms ? ` alle ${formatOra(staz.timestamp_ms)}` : '';
+
         if (!allarme.allarme_inviato && val >= soglia) {
             console.log(`🚨 SOGLIA CUSTOM SUPERATA: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
             await inviaPushAndroid(
                 [tokenProprietario],
                 `🚨 Allarme Personalizzato: ${staz.nomestaz}`,
-                `Livello attuale: ${fmt(val)} m (superata la tua soglia di ${fmt(soglia)} m)`
+                `Livello attuale: ${fmt(val)} m${stringaOrario} (superata la tua soglia di ${fmt(soglia)} m)`
             );
             await db.collection("allarmi").doc(d.id).update({ allarme_inviato: true });
         } else if (allarme.allarme_inviato && val < soglia) {
@@ -178,6 +189,8 @@ async function controllaFiumi() {
         const s2 = Number(staz.soglia2) || 0;
         const s3 = Number(staz.soglia3) || 0;
 
+        const stringaOrario = staz.timestamp_ms ? ` alle ${formatOra(staz.timestamp_ms)}` : '';
+
         let livelloAttuale = 0;
         if (s3 > 0 && val >= s3) livelloAttuale = 3;
         else if (s2 > 0 && val >= s2) livelloAttuale = 2;
@@ -185,7 +198,6 @@ async function controllaFiumi() {
 
         const livelloPrecedente = statiSalvati[idStaz] || 0;
 
-        // Se il livello è salito, invia le notifiche per TUTTE le soglie superate (anche se ne salta due insieme)
         if (livelloAttuale > livelloPrecedente) {
             for (let liv = livelloPrecedente + 1; liv <= livelloAttuale; liv++) {
                 let nomeSoglia = "", icona = "";
@@ -198,7 +210,7 @@ async function controllaFiumi() {
                     await inviaPushAndroid(
                         tokens,
                         `${icona} ${staz.nomestaz}: ${nomeSoglia}`,
-                        `Il fiume a ${staz.nomestaz} ha raggiunto ${fmt(val)} m.`
+                        `Il fiume a ${staz.nomestaz} ha raggiunto ${fmt(val)} m${stringaOrario}.`
                     );
                 }
             }
