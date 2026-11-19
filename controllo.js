@@ -49,18 +49,26 @@ async function leggiUltimoValoreGrafico(idStazione) {
     }
 }
 
-// Invia notifica ad alta priorità con sirena per svegliare Android
-async function inviaPushAndroid(tokens, titolo, messaggio) {
+// Invia notifica ad alta priorità scegliendo il canale (con sirena o silenzioso solo banner) e allegando i dati per lo scroll automatico
+async function inviaPushAndroid(tokens, titolo, messaggio, opzioni = {}) {
     const listaToken = Array.isArray(tokens) ? tokens.filter(Boolean) : [tokens].filter(Boolean);
     if (listaToken.length === 0) return;
 
+    const silent = Boolean(opzioni.silent);
+    const rawData = opzioni.data || {};
+    const dataPuliti = {};
+    for (const [k, v] of Object.entries(rawData)) {
+        if (v !== null && v !== undefined) dataPuliti[k] = String(v);
+    }
+
     const payload = {
         notification: { title: titolo, body: messaggio },
+        data: dataPuliti,
         android: {
             priority: "high",
             notification: {
-                channelId: "allarme_sirena_v1",
-                sound: "sirena.mp3",
+                channelId: silent ? "allarme_silenzioso_v1" : "allarme_sirena_v1",
+                sound: silent ? "silenzio.wav" : "sirena.mp3",
                 priority: "high",
                 defaultSound: false,
                 defaultVibrateTimings: true
@@ -70,7 +78,29 @@ async function inviaPushAndroid(tokens, titolo, messaggio) {
     };
 
     const resp = await admin.messaging().sendEachForMulticast(payload);
-    console.log(`📨 Push inviata: ${resp.successCount} ricevute, ${resp.failureCount} fallite.`);
+    console.log(`📨 Push (${silent ? 'Solo Banner' : 'Banner + Sirena'}) inviata: ${resp.successCount} ricevute, ${resp.failureCount} fallite.`);
+}
+
+// Smista automaticamente i destinatari in base alle loro preferenze individuali della pagina "Notifiche"
+async function inviaConPreferenze(tokens, chiavePref, titolo, messaggio, dataPayload, mappaPreferenze) {
+    const lista = [...new Set((Array.isArray(tokens) ? tokens : [tokens]).filter(Boolean))];
+    const conSuono = [];
+    const soloBanner = [];
+
+    for (const tk of lista) {
+        const prefsDisp = mappaPreferenze[tk];
+        const pref = (prefsDisp && prefsDisp[chiavePref]) ? prefsDisp[chiavePref] : { banner: true, suono: true };
+        if (pref.banner === false) continue; // Utente ha disattivato le notifiche per questa soglia
+        if (pref.suono === false) soloBanner.push(tk);
+        else conSuono.push(tk);
+    }
+
+    if (conSuono.length > 0) {
+        await inviaPushAndroid(conSuono, titolo, messaggio, { silent: false, data: dataPayload });
+    }
+    if (soloBanner.length > 0) {
+        await inviaPushAndroid(soloBanner, titolo, messaggio, { silent: true, data: dataPayload });
+    }
 }
 
 async function controllaFiumi() {
@@ -87,7 +117,7 @@ async function controllaFiumi() {
             data.slice(1).forEach(s => {
                 if (s.idstazione && (!stazioni[s.idstazione] || stazioni[s.idstazione].value === null)) {
                     stazioni[s.idstazione] = s;
-                    stazioni[s.idstazione].timestamp_ms = timestampQuarto; // Salviamo l'orario base per sicurezza
+                    stazioni[s.idstazione].timestamp_ms = timestampQuarto;
                 }
             });
         }
@@ -104,12 +134,16 @@ async function controllaFiumi() {
 
     const mappaMonitoraggi = {};
     const mappaDeviceIdToToken = {};
+    const mappaPreferenze = {};
 
     dispositiviSnap.forEach(d => {
         const token = d.id;
         const datiDisp = d.data();
         if (datiDisp.device_id) {
             mappaDeviceIdToToken[datiDisp.device_id] = token;
+        }
+        if (datiDisp.preferenze_notifiche) {
+            mappaPreferenze[token] = datiDisp.preferenze_notifiche;
         }
         (datiDisp.monitorate || []).forEach(idStaz => {
             if (!mappaMonitoraggi[idStaz]) mappaMonitoraggi[idStaz] = [];
@@ -141,13 +175,13 @@ async function controllaFiumi() {
             const fresco = await leggiUltimoValoreGrafico(idStaz);
             if (fresco !== null && stazioni[idStaz]) {
                 stazioni[idStaz].value = fresco.v;
-                stazioni[idStaz].timestamp_ms = fresco.t; // Sostituisce l'orario base con quello esatto al millisecondo del grafico
+                stazioni[idStaz].timestamp_ms = fresco.t;
             }
         }));
         if (i + 5 < idsArray.length) await pausa(250);
     }
 
-    console.log("🔔 3. Controllo soglie personalizzate (Campanelle singole per utente)...");
+    console.log("🔔 3. Controllo soglie personalizzate (Superamento + Rientro continuo)...");
     for (const d of snapAllarmi.docs) {
         const allarme = d.data();
         let staz = allarme.idstazione ? stazioni[allarme.idstazione] : null;
@@ -163,16 +197,41 @@ async function controllaFiumi() {
 
         const stringaOrario = staz.timestamp_ms ? ` alle ${formatOra(staz.timestamp_ms)}` : '';
 
+        // Superamento soglia personalizzata -> Pallino viola + notifica
         if (!allarme.allarme_inviato && val >= soglia) {
-            console.log(`🚨 SOGLIA CUSTOM SUPERATA: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
-            await inviaPushAndroid(
+            console.log(`🟣 SOGLIA CUSTOM SUPERATA: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
+            await inviaConPreferenze(
                 [tokenProprietario],
-                `🚨 Allarme Personalizzato: ${staz.nomestaz}`,
-                `Livello attuale: ${fmt(val)} m${stringaOrario} (superata la tua soglia di ${fmt(soglia)} m)`
+                'custom',
+                `🟣 Allarme Personalizzato: ${staz.nomestaz}`,
+                `Livello attuale: ${fmt(val)} m${stringaOrario} (superata la tua soglia di ${fmt(soglia)} m)`,
+                { stationId: staz.idstazione, alarmId: d.id, alertType: 'custom_over' },
+                mappaPreferenze
             );
-            await db.collection("allarmi").doc(d.id).update({ allarme_inviato: true });
-        } else if (allarme.allarme_inviato && val < soglia) {
-            await db.collection("allarmi").doc(d.id).update({ allarme_inviato: false });
+            await db.collection("allarmi").doc(d.id).update({
+                allarme_inviato: true,
+                stato_custom: "superata",
+                ultimo_valore: val,
+                aggiornato_il: new Date().toISOString()
+            });
+        }
+        // Rientro sotto soglia personalizzata -> Pallino azzurro + notifica + monitoraggio continua
+        else if (allarme.allarme_inviato && val < soglia) {
+            console.log(`🔵 RIENTRO SOGLIA CUSTOM: ${staz.nomestaz} (${val}m < ${soglia}m)`);
+            await inviaConPreferenze(
+                [tokenProprietario],
+                'custom',
+                `🔵 Rientro Soglia: ${staz.nomestaz}`,
+                `Livello attuale: ${fmt(val)} m${stringaOrario} (tornato sotto la tua soglia di ${fmt(soglia)} m)`,
+                { stationId: staz.idstazione, alarmId: d.id, alertType: 'custom_under' },
+                mappaPreferenze
+            );
+            await db.collection("allarmi").doc(d.id).update({
+                allarme_inviato: false,
+                stato_custom: "rientrata",
+                ultimo_valore: val,
+                aggiornato_il: new Date().toISOString()
+            });
         }
     }
 
@@ -200,17 +259,20 @@ async function controllaFiumi() {
 
         if (livelloAttuale > livelloPrecedente) {
             for (let liv = livelloPrecedente + 1; liv <= livelloAttuale; liv++) {
-                let nomeSoglia = "", icona = "";
-                if (liv === 1 && s1 > 0) { nomeSoglia = `Soglia 1 GIALLA`; icona = "🟡"; }
-                else if (liv === 2 && s2 > 0) { nomeSoglia = `Soglia 2 ARANCIONE`; icona = "🟠"; }
-                else if (liv === 3 && s3 > 0) { nomeSoglia = `Soglia 3 ROSSA`; icona = "🔴"; }
+                let nomeSoglia = "", icona = "", chiavePref = "";
+                if (liv === 1 && s1 > 0) { nomeSoglia = `Soglia 1 GIALLA`; icona = "🟡"; chiavePref = "soglia1"; }
+                else if (liv === 2 && s2 > 0) { nomeSoglia = `Soglia 2 ARANCIONE`; icona = "🟠"; chiavePref = "soglia2"; }
+                else if (liv === 3 && s3 > 0) { nomeSoglia = `Soglia 3 ROSSA`; icona = "🔴"; chiavePref = "soglia3"; }
 
                 if (nomeSoglia) {
                     console.log(`⚠️ SOGLIA UFFICIALE SUPERATA: ${staz.nomestaz} -> ${nomeSoglia} (Attuale: ${val}m)`);
-                    await inviaPushAndroid(
+                    await inviaConPreferenze(
                         tokens,
+                        chiavePref,
                         `${icona} ${staz.nomestaz}: ${nomeSoglia}`,
-                        `Il fiume a ${staz.nomestaz} ha raggiunto ${fmt(val)} m${stringaOrario}.`
+                        `Il fiume a ${staz.nomestaz} ha raggiunto ${fmt(val)} m${stringaOrario}.`,
+                        { stationId: idStaz, level: liv, alertType: 'official' },
+                        mappaPreferenze
                     );
                 }
             }
