@@ -49,10 +49,10 @@ async function leggiUltimoValoreGrafico(idStazione) {
     }
 }
 
-// Invia notifica ad alta priorità scegliendo il canale (con sirena o silenzioso solo banner) e allegando i dati per lo scroll automatico
+// Invia notifica e rimuove automaticamente eventuali token morti/scaduti da Firestore
 async function inviaPushAndroid(tokens, titolo, messaggio, opzioni = {}) {
-    const listaToken = Array.isArray(tokens) ? tokens.filter(Boolean) : [tokens].filter(Boolean);
-    if (listaToken.length === 0) return;
+    const tokenUnici = [...new Set((Array.isArray(tokens) ? tokens : [tokens]).filter(Boolean))];
+    if (tokenUnici.length === 0) return;
 
     const silent = Boolean(opzioni.silent);
     const rawData = opzioni.data || {};
@@ -74,14 +74,29 @@ async function inviaPushAndroid(tokens, titolo, messaggio, opzioni = {}) {
                 defaultVibrateTimings: true
             }
         },
-        tokens: [...new Set(listaToken)]
+        tokens: tokenUnici
     };
 
     const resp = await admin.messaging().sendEachForMulticast(payload);
     console.log(`📨 Push (${silent ? 'Solo Banner' : 'Banner + Sirena'}) inviata: ${resp.successCount} ricevute, ${resp.failureCount} fallite.`);
+
+    // Pulizia automatica dei token non più registrati per risparmiare letture Firestore
+    if (resp.failureCount > 0) {
+        for (let i = 0; i < resp.responses.length; i++) {
+            const r = resp.responses[i];
+            if (!r.success && r.error && (
+                r.error.code === 'messaging/registration-token-not-registered' ||
+                r.error.code === 'messaging/invalid-registration-token'
+            )) {
+                const badToken = tokenUnici[i];
+                console.log(`🧹 Rimuovo token scaduto dal database: ${badToken.slice(0, 12)}...`);
+                await db.collection("dispositivi").doc(badToken).delete().catch(() => { });
+            }
+        }
+    }
 }
 
-// Smista automaticamente i destinatari in base alle loro preferenze individuali della pagina "Notifiche"
+// Smista i destinatari in base alle preferenze individuali della pagina "Notifiche"
 async function inviaConPreferenze(tokens, chiavePref, titolo, messaggio, dataPayload, mappaPreferenze) {
     const lista = [...new Set((Array.isArray(tokens) ? tokens : [tokens]).filter(Boolean))];
     const conSuono = [];
@@ -90,7 +105,7 @@ async function inviaConPreferenze(tokens, chiavePref, titolo, messaggio, dataPay
     for (const tk of lista) {
         const prefsDisp = mappaPreferenze[tk];
         const pref = (prefsDisp && prefsDisp[chiavePref]) ? prefsDisp[chiavePref] : { banner: true, suono: true };
-        if (pref.banner === false) continue; // Utente ha disattivato le notifiche per questa soglia
+        if (pref.banner === false) continue;
         if (pref.suono === false) soloBanner.push(tk);
         else conSuono.push(tk);
     }
@@ -126,11 +141,30 @@ async function controllaFiumi() {
         return;
     }
 
-    const [dispositiviSnap, snapAllarmi, statiSnap] = await Promise.all([
+    const statoGlobaleRef = db.collection("stato_globale").doc("fiumi");
+
+    // Legge SOLO 1 documento per tutti gli stati delle stazioni invece di decine di documenti
+    const [dispositiviSnap, snapAllarmi, statoGlobaleSnap] = await Promise.all([
         db.collection("dispositivi").get(),
         db.collection("allarmi").get(),
-        db.collection("stati_stazioni").get()
+        statoGlobaleRef.get()
     ]);
+
+    let statiSalvati = {};
+    if (statoGlobaleSnap.exists) {
+        statiSalvati = statoGlobaleSnap.data().stazioni || {};
+    } else {
+        // Migrazione automatica una tantum dalla vecchia collezione stati_stazioni
+        console.log("🔄 Prima migrazione stati stazioni in documento unico...");
+        const vecchioSnap = await db.collection("stati_stazioni").get();
+        vecchioSnap.forEach(d => {
+            statiSalvati[d.id] = d.data().livello_allerta || 0;
+        });
+        await statoGlobaleRef.set({
+            stazioni: statiSalvati,
+            aggiornato_il: new Date().toISOString()
+        });
+    }
 
     const mappaMonitoraggi = {};
     const mappaDeviceIdToToken = {};
@@ -150,9 +184,6 @@ async function controllaFiumi() {
             mappaMonitoraggi[idStaz].push(token);
         });
     });
-
-    const statiSalvati = {};
-    statiSnap.forEach(d => statiSalvati[d.id] = d.data().livello_allerta || 0);
 
     const idDaAggiornareDalGrafico = new Set(Object.keys(mappaMonitoraggi));
 
@@ -197,7 +228,6 @@ async function controllaFiumi() {
 
         const stringaOrario = staz.timestamp_ms ? ` alle ${formatOra(staz.timestamp_ms)}` : '';
 
-        // Superamento soglia personalizzata -> Pallino viola + notifica
         if (!allarme.allarme_inviato && val >= soglia) {
             console.log(`🟣 SOGLIA CUSTOM SUPERATA: ${staz.nomestaz} (${val}m >= ${soglia}m)`);
             await inviaConPreferenze(
@@ -214,9 +244,7 @@ async function controllaFiumi() {
                 ultimo_valore: val,
                 aggiornato_il: new Date().toISOString()
             });
-        }
-        // Rientro sotto soglia personalizzata -> Pallino azzurro + notifica + monitoraggio continua
-        else if (allarme.allarme_inviato && val < soglia) {
+        } else if (allarme.allarme_inviato && val < soglia) {
             console.log(`🔵 RIENTRO SOGLIA CUSTOM: ${staz.nomestaz} (${val}m < ${soglia}m)`);
             await inviaConPreferenze(
                 [tokenProprietario],
@@ -236,7 +264,7 @@ async function controllaFiumi() {
     }
 
     console.log("🚦 4. Controllo soglie ufficiali S1/S2/S3...");
-    const batch = db.batch();
+    let statiModificati = false;
 
     for (const [idStaz, tokens] of Object.entries(mappaMonitoraggi)) {
         if (tokens.length === 0) continue;
@@ -279,17 +307,19 @@ async function controllaFiumi() {
         }
 
         if (livelloAttuale !== livelloPrecedente) {
-            batch.set(db.collection("stati_stazioni").doc(idStaz), {
-                stazione: staz.nomestaz,
-                livello_allerta: livelloAttuale,
-                ultimo_valore: val,
-                aggiornato_il: new Date().toISOString()
-            }, { merge: true });
+            statiSalvati[idStaz] = livelloAttuale;
+            statiModificati = true;
         }
     }
 
-    await batch.commit();
-    console.log("✅ Controllo completato con successo.");
+    if (statiModificati) {
+        await statoGlobaleRef.set({
+            stazioni: statiSalvati,
+            aggiornato_il: new Date().toISOString()
+        });
+    }
+
+    console.log(`✅ Controllo completato (Dispositivi: ${dispositiviSnap.size}, Allarmi: ${snapAllarmi.size}).`);
 }
 
 controllaFiumi();
